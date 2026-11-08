@@ -17,15 +17,12 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
-	"github.com/metacubex/mihomo/listener/sing"
-	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/listener/jls"
+	"github.com/metacubex/mihomo/listener/restls"
+	"github.com/metacubex/mihomo/listener/shadowtls"
 	"github.com/metacubex/mihomo/transport/shadowsocks/shadowaead"
 	obfs "github.com/metacubex/mihomo/transport/simple-obfs"
 	"github.com/metacubex/mihomo/transport/snell"
-
-	shadowtls "github.com/metacubex/sing-shadowtls"
-	"github.com/metacubex/sing/common"
-	M "github.com/metacubex/sing/common/metadata"
 )
 
 const maxPacketLength = 0x3fff
@@ -34,7 +31,7 @@ type Listener struct {
 	closed    bool
 	config    LC.SnellServer
 	listeners []net.Listener
-	shadowTLS *shadowtls.Service
+	v6Mode    snell.V6Mode // only used for version 6
 }
 
 func New(config LC.SnellServer, lc C.InboundListenConfig, tunnel C.Tunnel, additions ...inbound.Addition) (C.MultiAddrListener, error) {
@@ -43,6 +40,10 @@ func New(config LC.SnellServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 	}
 	switch config.Version {
 	case snell.Version1, snell.Version2, snell.Version3, snell.Version4, snell.Version5:
+		if config.Mode != "" {
+			return nil, errors.New("snell inbound mode is only supported on version 6")
+		}
+	case snell.Version6:
 	default:
 		return nil, fmt.Errorf("snell inbound version %d is not supported", config.Version)
 	}
@@ -56,47 +57,51 @@ func New(config LC.SnellServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 	}
 
 	l := &Listener{config: config}
-
-	if config.ShadowTLS.Enable {
-		buildHandshake := func(handshake LC.ShadowTLSHandshakeOptions) (handshakeConfig shadowtls.HandshakeConfig) {
-			handshakeConfig.Server = M.ParseSocksaddr(handshake.Dest)
-			handshakeConfig.Dialer = sing.NewDialer(tunnel, handshake.Proxy)
-			return
+	if config.Version == snell.Version6 {
+		if err := snell.ValidateV6PSK([]byte(config.Psk)); err != nil {
+			return nil, fmt.Errorf("snell inbound %w", err)
 		}
-		var handshakeForServerName map[string]shadowtls.HandshakeConfig
-		if config.ShadowTLS.Version > 1 {
-			handshakeForServerName = make(map[string]shadowtls.HandshakeConfig)
-			for serverName, serverOptions := range config.ShadowTLS.HandshakeForServerName {
-				handshakeForServerName[serverName] = buildHandshake(serverOptions)
-			}
-		}
-		var wildcardSNI shadowtls.WildcardSNI
-		switch config.ShadowTLS.WildcardSNI {
-		case "authed":
-			wildcardSNI = shadowtls.WildcardSNIAuthed
-		case "all":
-			wildcardSNI = shadowtls.WildcardSNIAll
-		default:
-			wildcardSNI = shadowtls.WildcardSNIOff
+		if config.ObfsMode != "" {
+			// v6 replaced the simple-obfs layer with PSK-derived traffic shaping
+			return nil, fmt.Errorf("snell inbound version 6 does not support obfs mode %s", config.ObfsMode)
 		}
 		var err error
-		l.shadowTLS, err = shadowtls.NewService(shadowtls.ServiceConfig{
-			Version:  config.ShadowTLS.Version,
-			Password: config.ShadowTLS.Password,
-			Users: common.Map(config.ShadowTLS.Users, func(it LC.ShadowTLSUser) shadowtls.User {
-				return shadowtls.User{Name: it.Name, Password: it.Password}
-			}),
-			Handshake:              buildHandshake(config.ShadowTLS.Handshake),
-			HandshakeForServerName: handshakeForServerName,
-			StrictMode:             config.ShadowTLS.StrictMode,
-			WildcardSNI:            wildcardSNI,
-			Handler: sing.FnHandler{
-				NewConnectionFn: func(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-					l.handleConn(conn, tunnel, sing.AdditionsFromContext(ctx)...)
-					return nil
-				}},
-			Logger: log.SingLogger,
-		})
+		l.v6Mode, err = snell.ParseV6Mode(config.Mode)
+		if err != nil {
+			return nil, fmt.Errorf("snell inbound %w", err)
+		}
+	}
+
+	securityModes := make([]string, 0, 3)
+	if config.ShadowTLS.Enable {
+		securityModes = append(securityModes, "shadow-tls")
+	}
+	if config.ResTLS.Enable {
+		securityModes = append(securityModes, "res-tls")
+	}
+	if config.JLSConfig.Enable {
+		securityModes = append(securityModes, "jls")
+	}
+	if len(securityModes) > 1 {
+		return nil, errors.New("security modes are mutually exclusive: " + strings.Join(securityModes, ", "))
+	}
+
+	var shadowTLSBuilder *shadowtls.Builder
+	if config.ShadowTLS.Enable {
+		var err error
+		shadowTLSBuilder, err = shadowtls.New(config.ShadowTLS, tunnel)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var restlsBuilder *restls.Builder
+	if config.ResTLS.Enable {
+		restlsBuilder = restls.New(config.ResTLS, tunnel)
+	}
+	var jlsBuilder *jls.Builder
+	if config.JLSConfig.Enable {
+		var err error
+		jlsBuilder, err = jls.New(config.JLSConfig, tunnel)
 		if err != nil {
 			return nil, err
 		}
@@ -110,6 +115,13 @@ func New(config LC.SnellServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 		if err != nil {
 			_ = l.Close()
 			return nil, err
+		}
+		if shadowTLSBuilder != nil {
+			ln = shadowTLSBuilder.NewListener(ln)
+		} else if restlsBuilder != nil {
+			ln = restlsBuilder.NewListener(ln)
+		} else if jlsBuilder != nil {
+			ln = jlsBuilder.NewListener(ln)
 		}
 		l.listeners = append(l.listeners, ln)
 		go func(ln net.Listener) {
@@ -152,19 +164,13 @@ func (l *Listener) AddrList() (addrList []net.Addr) {
 
 func (l *Listener) HandleConn(rawConn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
 	defer rawConn.Close()
-	conn := rawConn
-	if l.shadowTLS != nil {
-		ctx := sing.WithAdditions(context.TODO(), additions...)
-		_ = l.shadowTLS.NewConnection(ctx, conn, M.Metadata{
-			Protocol: "snell",
-			Source:   M.SocksaddrFromNet(conn.RemoteAddr()),
-		})
-		return
+	user, loaded := shadowtls.UserFromConn(rawConn)
+	if jlsUser, jlsLoaded := jls.UserFromConn(rawConn); jlsLoaded {
+		user, loaded = jlsUser, true
 	}
-	l.handleConn(rawConn, tunnel, additions...)
-}
-
-func (l *Listener) handleConn(rawConn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
+	if loaded {
+		additions = append(append([]inbound.Addition(nil), additions...), inbound.WithInUser(user))
+	}
 	conn := rawConn
 	switch l.config.ObfsMode {
 	case "http":
@@ -175,7 +181,12 @@ func (l *Listener) handleConn(rawConn net.Conn, tunnel C.Tunnel, additions ...in
 	default:
 		return
 	}
-	stream := snell.ServerStreamConn(conn, []byte(l.config.Psk), l.config.Version)
+	var stream *snell.Snell
+	if l.config.Version == snell.Version6 {
+		stream = snell.ServerStreamConnV6(conn, []byte(l.config.Psk), l.v6Mode)
+	} else {
+		stream = snell.ServerStreamConn(conn, []byte(l.config.Psk), l.config.Version)
+	}
 	for {
 		reuse, err := l.handleRequest(stream, tunnel, additions...)
 		if err != nil || !reuse {

@@ -9,8 +9,10 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/structure"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/jls"
+	"github.com/metacubex/mihomo/transport/restls"
+	"github.com/metacubex/mihomo/transport/shadowtls"
 	obfs "github.com/metacubex/mihomo/transport/simple-obfs"
-	shadowtls "github.com/metacubex/mihomo/transport/sing-shadowtls"
 	"github.com/metacubex/mihomo/transport/snell"
 )
 
@@ -21,7 +23,10 @@ type Snell struct {
 	pool            *snell.Pool
 	obfsOption      *simpleObfsOption
 	shadowTLSOption *shadowtls.ShadowTLSOption
+	restlsConfig    *restls.Config
+	jlsConfig       *jls.ClientConfig
 	version         int
+	v6Mode          snell.V6Mode
 	reuse           bool
 }
 
@@ -34,6 +39,7 @@ type SnellOption struct {
 	UDP               bool           `proxy:"udp,omitempty"`
 	Version           int            `proxy:"version,omitempty"`
 	Reuse             bool           `proxy:"reuse,omitempty"`
+	Mode              string         `proxy:"mode,omitempty"` // v6 only: default / unshaped / unsafe-raw
 	ObfsOpts          map[string]any `proxy:"obfs-opts,omitempty"`
 	ClientFingerprint string         `proxy:"client-fingerprint,omitempty"`
 }
@@ -51,6 +57,19 @@ func (s *Snell) streamConnContext(ctx context.Context, c net.Conn) (*snell.Snell
 		if err != nil {
 			return nil, err
 		}
+	case restls.Mode:
+		c, err = restls.NewRestls(ctx, c, s.restlsConfig)
+		if err != nil {
+			return nil, err
+		}
+	case jls.Mode:
+		c, err = jls.NewClient(ctx, c, s.jlsConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if s.version == snell.Version6 {
+		return snell.StreamConnV6(c, s.psk, s.v6Mode), nil
 	}
 	return snell.StreamConn(c, s.psk, s.version), nil
 }
@@ -161,6 +180,8 @@ func NewSnell(option SnellOption) (*Snell, error) {
 	}
 
 	var shadowTLSOpt *shadowtls.ShadowTLSOption
+	var restlsConfig *restls.Config
+	var jlsConfig *jls.ClientConfig
 	switch obfsOption.Mode {
 	case "tls", "http", "":
 		break
@@ -189,6 +210,38 @@ func NewSnell(option SnellOption) (*Snell, error) {
 		} else {
 			shadowTLSOpt.ALPN = shadowtls.DefaultALPN
 		}
+	case restls.Mode:
+		opt := &restlsOption{}
+		if err := decoder.Decode(option.ObfsOpts, opt); err != nil {
+			return nil, fmt.Errorf("snell %s initialize restls-plugin error: %w", addr, err)
+		}
+
+		var err error
+		restlsConfig, err = restls.NewRestlsConfig(opt.Host, opt.Password, opt.VersionHint, opt.RestlsScript, option.ClientFingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("snell %s initialize restls-plugin error: %w", addr, err)
+		}
+		restlsConfig.InsecureSkipVerify = opt.SkipCertVerify
+		if opt.Fingerprint != "" {
+			if err = restls.SetFingerprint(restlsConfig, opt.Fingerprint, opt.NameCertVerify); err != nil {
+				return nil, fmt.Errorf("snell %s initialize restls-plugin error: %w", addr, err)
+			}
+		} else if opt.NameCertVerify != "" {
+			restls.SetNameCertVerify(restlsConfig, opt.NameCertVerify)
+		}
+		restlsConfig.ForceTLS12 = opt.ForceTLS12
+	case jls.Mode:
+		opt := &jlsOption{}
+		if err := decoder.Decode(option.ObfsOpts, opt); err != nil {
+			return nil, fmt.Errorf("snell %s initialize jls-plugin error: %w", addr, err)
+		}
+
+		var err error
+		jlsConfig, err = jls.NewClientConfig(opt.Host, opt.Username, opt.Password, opt.ALPN)
+		if err != nil {
+			return nil, fmt.Errorf("snell %s initialize jls-plugin error: %w", addr, err)
+		}
+		jlsConfig.ClientFingerprint = option.ClientFingerprint
 	default:
 		return nil, fmt.Errorf("snell %s obfs mode error: %s", addr, obfsOption.Mode)
 	}
@@ -201,15 +254,34 @@ func NewSnell(option SnellOption) (*Snell, error) {
 		// Snell v5 servers are backward-compatible with v4 clients.
 		option.Version = snell.Version4
 	}
-	reuse := option.Version == snell.Version2 || (option.Version == snell.Version4 && option.Reuse)
+	reuse := option.Version == snell.Version2 ||
+		((option.Version == snell.Version4 || option.Version == snell.Version6) && option.Reuse)
+	var v6Mode snell.V6Mode
 	switch option.Version {
 	case snell.Version1, snell.Version2:
 		if option.UDP {
 			return nil, fmt.Errorf("snell version %d not support UDP", option.Version)
 		}
 	case snell.Version3, snell.Version4:
+	case snell.Version6:
+		if err := snell.ValidateV6PSK(psk); err != nil {
+			return nil, fmt.Errorf("snell %s %w", addr, err)
+		}
+		switch obfsOption.Mode {
+		case "tls", "http":
+			// v6 replaced the simple-obfs layer with PSK-derived traffic shaping
+			return nil, fmt.Errorf("snell %s version 6 does not support obfs mode %s", addr, obfsOption.Mode)
+		}
+		var err error
+		v6Mode, err = snell.ParseV6Mode(option.Mode)
+		if err != nil {
+			return nil, fmt.Errorf("snell %s %w", addr, err)
+		}
 	default:
 		return nil, fmt.Errorf("snell version error: %d", option.Version)
+	}
+	if option.Mode != "" && option.Version != snell.Version6 {
+		return nil, fmt.Errorf("snell %s mode is only supported on version 6", addr)
 	}
 
 	s := &Snell{
@@ -229,7 +301,10 @@ func NewSnell(option SnellOption) (*Snell, error) {
 		psk:             psk,
 		obfsOption:      obfsOption,
 		shadowTLSOption: shadowTLSOpt,
+		restlsConfig:    restlsConfig,
+		jlsConfig:       jlsConfig,
 		version:         option.Version,
+		v6Mode:          v6Mode,
 		reuse:           reuse,
 	}
 	s.dialer = option.NewDialer(s.DialOptions())
@@ -241,7 +316,12 @@ func NewSnell(option SnellOption) (*Snell, error) {
 				return nil, err
 			}
 
-			return s.streamConnContext(ctx, c)
+			sc, err := s.streamConnContext(ctx, c)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			return sc, nil
 		})
 	}
 	return s, nil

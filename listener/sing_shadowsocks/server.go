@@ -2,29 +2,31 @@ package sing_shadowsocks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/sockopt"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
-	"github.com/metacubex/mihomo/listener/inner"
+	"github.com/metacubex/mihomo/listener/jls"
+	"github.com/metacubex/mihomo/listener/restls"
 	embedSS "github.com/metacubex/mihomo/listener/shadowsocks"
+	"github.com/metacubex/mihomo/listener/shadowtls"
 	"github.com/metacubex/mihomo/listener/sing"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
-	"github.com/metacubex/mihomo/transport/jls"
 	"github.com/metacubex/mihomo/transport/kcptun"
-	"github.com/metacubex/mihomo/transport/restls"
 	obfs "github.com/metacubex/mihomo/transport/simple-obfs"
 
 	shadowsocks "github.com/metacubex/sing-shadowsocks"
 	"github.com/metacubex/sing-shadowsocks/shadowaead"
 	"github.com/metacubex/sing-shadowsocks/shadowaead_2022"
-	shadowtls "github.com/metacubex/sing-shadowtls"
 	"github.com/metacubex/sing/common"
+	"github.com/metacubex/sing/common/auth"
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
 	M "github.com/metacubex/sing/common/metadata"
@@ -36,27 +38,17 @@ type Listener struct {
 	config       LC.ShadowsocksServer
 	listeners    []net.Listener
 	udpListeners []net.PacketConn
-	service      shadowsocks.Service
-	shadowTLS    *shadowtls.Service
-	resTLS       *restls.ServerConfig
-	jls          *jls.ServerConfig
+	service      service
 	simpleObfs   func(net.Conn) net.Conn
 }
 
+// service is the common part of shadowsocks.Service and shadowsocks.MultiService
+type service interface {
+	network.TCPConnectionHandler
+	network.UDPHandler
+}
+
 var _listener *Listener
-
-// shadowTLSService is a wrapper for shadowsocks.Service to support shadowTLS.
-type shadowTLSService struct {
-	shadowsocks.Service
-	shadowTLS *shadowtls.Service
-}
-
-func (s *shadowTLSService) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	if s.shadowTLS != nil {
-		return s.shadowTLS.NewConnection(ctx, conn, metadata)
-	}
-	return s.Service.NewConnection(ctx, conn, metadata)
-}
 
 func New(config LC.ShadowsocksServer, lc C.InboundListenConfig, tunnel C.Tunnel, additions ...inbound.Addition) (C.MultiAddrListener, error) {
 	var sl *Listener
@@ -87,6 +79,8 @@ func New(config LC.ShadowsocksServer, lc C.InboundListenConfig, tunnel C.Tunnel,
 	sl.config = config
 
 	switch {
+	case len(config.Users) > 0:
+		sl.service, err = newMultiService(config, udpTimeout, h)
 	case config.Cipher == shadowsocks.MethodNone:
 		sl.service = shadowsocks.NewNoneService(udpTimeout, h)
 	case common.Contains(shadowaead.List, config.Cipher):
@@ -101,76 +95,36 @@ func New(config LC.ShadowsocksServer, lc C.InboundListenConfig, tunnel C.Tunnel,
 		return nil, err
 	}
 
+	securityModes := make([]string, 0, 3)
 	if config.ShadowTLS.Enable {
-		buildHandshake := func(handshake LC.ShadowTLSHandshakeOptions) (handshakeConfig shadowtls.HandshakeConfig) {
-			handshakeConfig.Server = M.ParseSocksaddr(handshake.Dest)
-			handshakeConfig.Dialer = sing.NewDialer(tunnel, handshake.Proxy)
-			return
-		}
-		var handshakeForServerName map[string]shadowtls.HandshakeConfig
-		if config.ShadowTLS.Version > 1 {
-			handshakeForServerName = make(map[string]shadowtls.HandshakeConfig)
-			for serverName, serverOptions := range config.ShadowTLS.HandshakeForServerName {
-				handshakeForServerName[serverName] = buildHandshake(serverOptions)
-			}
-		}
-		var wildcardSNI shadowtls.WildcardSNI
-		switch config.ShadowTLS.WildcardSNI {
-		case "authed":
-			wildcardSNI = shadowtls.WildcardSNIAuthed
-		case "all":
-			wildcardSNI = shadowtls.WildcardSNIAll
-		default:
-			wildcardSNI = shadowtls.WildcardSNIOff
-		}
-		var shadowTLS *shadowtls.Service
-		shadowTLS, err = shadowtls.NewService(shadowtls.ServiceConfig{
-			Version:  config.ShadowTLS.Version,
-			Password: config.ShadowTLS.Password,
-			Users: common.Map(config.ShadowTLS.Users, func(it LC.ShadowTLSUser) shadowtls.User {
-				return shadowtls.User{Name: it.Name, Password: it.Password}
-			}),
-			Handshake:              buildHandshake(config.ShadowTLS.Handshake),
-			HandshakeForServerName: handshakeForServerName,
-			StrictMode:             config.ShadowTLS.StrictMode,
-			WildcardSNI:            wildcardSNI,
-			Handler:                sl.service,
-			Logger:                 log.SingLogger,
-		})
+		securityModes = append(securityModes, "shadow-tls")
+	}
+	if config.ResTLS.Enable {
+		securityModes = append(securityModes, "res-tls")
+	}
+	if config.JLSConfig.Enable {
+		securityModes = append(securityModes, "jls")
+	}
+	if len(securityModes) > 1 {
+		return nil, fmt.Errorf("security modes are mutually exclusive: %s", strings.Join(securityModes, ", "))
+	}
+
+	var shadowTLSBuilder *shadowtls.Builder
+	if config.ShadowTLS.Enable {
+		shadowTLSBuilder, err = shadowtls.New(config.ShadowTLS, tunnel)
 		if err != nil {
 			return nil, err
 		}
-		sl.service = &shadowTLSService{
-			Service:   sl.service,
-			shadowTLS: shadowTLS,
-		}
 	}
 
+	var restlsBuilder *restls.Builder
 	if config.ResTLS.Enable {
-		sl.resTLS = &restls.ServerConfig{
-			ServerHostname: config.ResTLS.Dest,
-			Password:       config.ResTLS.Password,
-			RestlsScript:   config.ResTLS.RestlsScript,
-			MinRecordLen:   config.ResTLS.MinRecordLen,
-			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return inner.HandleTcp(tunnel, address, config.ResTLS.Proxy)
-			},
-		}
+		restlsBuilder = restls.New(config.ResTLS, tunnel)
 	}
 
+	var jlsBuilder *jls.Builder
 	if config.JLSConfig.Enable {
-		sl.jls, err = jls.NewServerConfig(
-			config.JLSConfig.SNI,
-			config.JLSConfig.Dest,
-			common.Map(config.JLSConfig.Users, func(user LC.JLSUser) jls.User {
-				return jls.User{Username: user.Username, Password: user.Password}
-			}),
-			config.JLSConfig.ALPN,
-			config.JLSConfig.RateLimit,
-			func(ctx context.Context, network, address string) (net.Conn, error) {
-				return inner.HandleTcp(tunnel, address, config.JLSConfig.Proxy)
-			},
-		)
+		jlsBuilder, err = jls.New(config.JLSConfig, tunnel)
 		if err != nil {
 			return nil, err
 		}
@@ -262,6 +216,13 @@ func New(config LC.ShadowsocksServer, lc C.InboundListenConfig, tunnel C.Tunnel,
 		if err != nil {
 			return nil, err
 		}
+		if shadowTLSBuilder != nil {
+			l = shadowTLSBuilder.NewListener(l)
+		} else if restlsBuilder != nil {
+			l = restlsBuilder.NewListener(l)
+		} else if jlsBuilder != nil {
+			l = jlsBuilder.NewListener(l)
+		}
 		sl.listeners = append(sl.listeners, l)
 
 		go func() {
@@ -280,6 +241,48 @@ func New(config LC.ShadowsocksServer, lc C.InboundListenConfig, tunnel C.Tunnel,
 	}
 
 	return sl, nil
+}
+
+// newMultiService creates a service that identifies the user by its password,
+// the matched username is passed to the tunnel as metadata.InUser.
+//
+// For 2022-blake3-aes-* methods, config.Password is the server PSK (iPSK) and each user password is
+// the user PSK (uPSK), so the client password is "iPSK:uPSK".
+// For legacy AEAD methods, each user password is used directly and config.Password must be empty.
+// Legacy AEAD has no user identity in the packet, so every user is tried for each packet, which makes
+// the cost grow linearly with the number of users.
+func newMultiService(config LC.ShadowsocksServer, udpTimeout int64, handler shadowsocks.Handler) (service, error) {
+	var multiService shadowsocks.MultiService[string]
+	var err error
+	switch {
+	case common.Contains(shadowaead.List, config.Cipher):
+		if config.Password != "" {
+			return nil, fmt.Errorf("shadowsocks: password must be empty when users is set for method: %s", config.Cipher)
+		}
+		multiService, err = shadowaead.NewMultiService[string](config.Cipher, udpTimeout, handler)
+	case common.Contains(shadowaead_2022.List, config.Cipher):
+		multiService, err = shadowaead_2022.NewMultiServiceWithPassword[string](config.Cipher, config.Password, udpTimeout, handler, ntp.Now)
+		if errors.Is(err, os.ErrInvalid) { // 2022-blake3-chacha*-poly1305 can't identify users
+			err = fmt.Errorf("shadowsocks: users is not supported for method: %s", config.Cipher)
+		}
+	default:
+		err = fmt.Errorf("shadowsocks: users is not supported for method: %s", config.Cipher)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	userNameList := make([]string, 0, len(config.Users))
+	userPasswordList := make([]string, 0, len(config.Users))
+	for name, password := range config.Users {
+		userNameList = append(userNameList, name)
+		userPasswordList = append(userPasswordList, password)
+	}
+	err = multiService.UpdateUsersWithPasswords(userNameList, userPasswordList)
+	if err != nil {
+		return nil, err
+	}
+	return multiService, nil
 }
 
 func (l *Listener) Close() error {
@@ -315,25 +318,16 @@ func (l *Listener) AddrList() (addrList []net.Addr) {
 }
 
 func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
-	ctx := sing.WithAdditions(context.TODO(), additions...)
-	if l.jls != nil {
-		c, err := jls.Server(context.TODO(), conn, l.jls)
-		if err != nil {
-			_ = conn.Close()
-			return
-		}
-		conn = c
-	}
-	if l.resTLS != nil {
-		c, err := restls.Server(context.TODO(), conn, l.resTLS)
-		if err != nil {
-			_ = conn.Close()
-			return
-		}
-		conn = c
+	user, loaded := shadowtls.UserFromConn(conn)
+	if jlsUser, jlsLoaded := jls.UserFromConn(conn); jlsLoaded {
+		user, loaded = jlsUser, true
 	}
 	if l.simpleObfs != nil {
 		conn = l.simpleObfs(conn)
+	}
+	ctx := sing.WithAdditions(context.TODO(), additions...)
+	if loaded {
+		ctx = auth.ContextWithUser(ctx, user)
 	}
 	err := l.service.NewConnection(ctx, conn, M.Metadata{
 		Protocol: "shadowsocks",
